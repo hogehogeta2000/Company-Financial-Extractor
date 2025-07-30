@@ -25,7 +25,7 @@ class EDINETCompanyExtractor:
             "従業員数": ["numberofemployees", "employees"]
         }
     
-    def search_securities_reports_by_date_range(self, search_days=730):
+    def get_securities_reports_by_date_range(self, search_days=730):
         """
         指定期間の有価証券報告書のみを取得
         
@@ -309,57 +309,50 @@ class EDINETCompanyExtractor:
         except:
             return None
     
-    def extract_companies_data(self, company_names, search_days=365):
+    def extract_companies_data(self, company_names, search_days=730):
         """
-        複数企業名のデータを抽出
+        複数企業名の最新有価証券報告書データを抽出
         
         Args:
             company_names (list): 企業名のリスト
-            search_days (int): 検索する過去の日数
+            search_days (int): 検索する過去の日数（デフォルト730日）
         
         Returns:
             pd.DataFrame: 抽出結果のDataFrame
         """
-        print(f"=== EDINET企業財務データ抽出開始 ===")
+        print(f"=== EDINET 最新有価証券報告書データ抽出 ===")
         print(f"対象企業数: {len(company_names)}")
-        print(f"検索期間: 過去{search_days}日")
+        print(f"検索期間: 過去{search_days}日（最新データまで）")
         print("=" * 60)
         
-        # 1. 期間設定
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=search_days)
+        # 1. 指定期間の有価証券報告書のみを取得
+        securities_reports = self.get_securities_reports_by_date_range(search_days)
         
-        # 2. 期間内の全書類を取得
-        all_documents = self.search_documents_by_date_range(
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-            max_days=search_days
-        )
-        
-        if not all_documents:
-            print("❌ 期間内に書類が見つかりませんでした")
+        if not securities_reports:
+            print("❌ 期間内に有価証券報告書が見つかりませんでした")
             return pd.DataFrame()
         
-        # 3. 企業名で書類を検索
-        company_documents = self.find_company_documents(company_names, all_documents)
+        # 2. 企業名で最新の有価証券報告書を検索
+        company_reports = self.find_latest_company_reports(company_names, securities_reports)
         
-        # 4. 各企業のデータを抽出
+        # 3. 各企業のデータを抽出
         results = []
         
-        print(f"\\n=== 財務データ抽出開始 ===")
+        print(f"\\n=== 財務データ抽出処理 ===")
         
         for i, company_name in enumerate(company_names, 1):
-            print(f"\\n[{i}/{len(company_names)}] {company_name} の財務データを抽出中...")
+            print(f"\\n[{i}/{len(company_names)}] {company_name} の財務データ抽出中...")
             
-            company_info = company_documents.get(company_name)
+            company_info = company_reports.get(company_name)
             
-            if not company_info or not company_info.get("document"):
+            if not company_info or not company_info.get("report"):
                 error_msg = company_info.get("error", "不明なエラー") if company_info else "企業情報が見つかりません"
                 print(f"  ❌ エラー: {error_msg}")
                 results.append({
                     "企業名": company_name,
                     "docID": None,
                     "docDescription": None,
+                    "提出日": None,
                     "売上高": None,
                     "資本金": None,
                     "従業員数": None,
@@ -367,16 +360,19 @@ class EDINETCompanyExtractor:
                 })
                 continue
             
-            doc = company_info["document"]
+            report = company_info["report"]
             actual_name = company_info["actual_name"]
-            doc_id = doc.get("docID")
-            doc_description = doc.get("docDescription", "")
+            doc_id = report.get("docID")
+            doc_description = report.get("docDescription", "")
+            submit_date = report.get("submitDateTime", "")[:10] if report.get("submitDateTime") else ""
             
-            print(f"  📄 企業名: {actual_name}")
+            print(f"  📊 企業名: {actual_name}")
             print(f"  📄 報告書: {doc_description}")
-            print(f"  📄 docID: {doc_id}")
+            print(f"  📅 提出日: {submit_date}")
+            print(f"  🆔 docID: {doc_id}")
             
             # XBRLデータを取得
+            print(f"  🔄 XBRLデータを取得中...")
             xbrl_result = self.get_xbrl_document(doc_id)
             
             if not xbrl_result["success"]:
@@ -385,6 +381,7 @@ class EDINETCompanyExtractor:
                     "企業名": actual_name,
                     "docID": doc_id,
                     "docDescription": doc_description,
+                    "提出日": submit_date,
                     "売上高": None,
                     "資本金": None,
                     "従業員数": None,
@@ -393,6 +390,7 @@ class EDINETCompanyExtractor:
                 continue
             
             # 財務データを抽出
+            print(f"  🔄 財務データを解析中...")
             financial_result = self.extract_financial_data_from_csv(xbrl_result["content"])
             
             if not financial_result["success"]:
@@ -401,6 +399,7 @@ class EDINETCompanyExtractor:
                     "企業名": actual_name,
                     "docID": doc_id,
                     "docDescription": doc_description,
+                    "提出日": submit_date,
                     "売上高": None,
                     "資本金": None,
                     "従業員数": None,
@@ -415,6 +414,7 @@ class EDINETCompanyExtractor:
                 "企業名": actual_name,
                 "docID": doc_id,
                 "docDescription": doc_description,
+                "提出日": submit_date,
                 "売上高": financial_data.get("売上高"),
                 "資本金": financial_data.get("資本金"),
                 "従業員数": financial_data.get("従業員数"),
@@ -426,8 +426,22 @@ class EDINETCompanyExtractor:
             
             results.append(company_data)
             
-            extracted_count = sum(1 for v in [financial_data.get("売上高"), financial_data.get("資本金"), financial_data.get("従業員数")] if v is not None)
-            print(f"  ✅ 完了: {extracted_count}/3 個の財務指標を抽出")
+            # 抽出成功の指標データ数をカウント
+            extracted_count = sum(1 for v in [
+                financial_data.get("売上高"), 
+                financial_data.get("資本金"), 
+                financial_data.get("従業員数")
+            ] if v is not None)
+            
+            print(f"  ✅ 完了: {extracted_count}/3 個の財務指標を抽出しました")
+            
+            # 財務データの概要表示
+            if financial_data.get("売上高"):
+                print(f"     💰 売上高: {financial_data.get('売上高'):,.0f}円")
+            if financial_data.get("資本金"):
+                print(f"     🏦 資本金: {financial_data.get('資本金'):,.0f}円")
+            if financial_data.get("従業員数"):
+                print(f"     👥 従業員数: {financial_data.get('従業員数'):,.0f}人")
         
         # DataFrameに変換
         df = pd.DataFrame(results)
