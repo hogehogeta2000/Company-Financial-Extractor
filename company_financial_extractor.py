@@ -5,145 +5,183 @@ import pandas as pd
 from datetime import datetime, timedelta
 import re
 from difflib import SequenceMatcher
+import time
 
-class EDINETCompanyNameExtractor:
+class EDINETCompanyExtractor:
     def __init__(self, subscription_key):
         """
-        EDINET企業名検索データ抽出クライアントの初期化
+        EDINET企業データ抽出クライアントの初期化（API v2対応）
         """
         self.subscription_key = subscription_key
         self.base_url = "https://api.edinet-fsa.go.jp/api/v2"
         self.headers = {
-            "Ocp-Apim-Subscription-Key": subscription_key,
             "Content-Type": "application/json"
         }
         
         # 指定されたカラムの財務指標マッピング
         self.target_indicators = {
-            "売上高": ["netsales", "operatingrevenues", "revenue", "ordingyrevenues"],
+            "売上高": ["netsales", "operatingrevenues", "revenue", "operatingincome"],
             "資本金": ["capitalstock", "paidincapital", "capital"],
             "従業員数": ["numberofemployees", "employees"]
         }
     
-    def search_company_by_name(self, company_name):
+    def search_securities_reports_by_date_range(self, search_days=730):
         """
-        企業名で企業を検索し、最も適合する企業を返す
+        指定期間の有価証券報告書のみを取得
         
         Args:
-            company_name (str): 検索する企業名
-            
+            search_days (int): 検索する過去の日数（デフォルト730日）
+        
         Returns:
-            dict: 検索結果
+            list: 有価証券報告書のデータリスト
         """
-        url = f"{self.base_url}/documents.json"
+        # 現在日時を取得（最新データを確実に取得するため）
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=search_days)
         
-        # 過去2年間を検索範囲とする
-        end_date = datetime.now().strftime("%Y-%m-%d")
+        print(f"🔍 有価証券報告書検索期間: {start_date.strftime('%Y-%m-%d')} ～ {end_date.strftime('%Y-%m-%d')}")
+        print(f"   検索対象: 有価証券報告書（docTypeCode: 120）のみ")
         
-        params = {
-            "date": end_date,
-            "type": "1",  # 企業名での検索
-            "code": company_name,  # 企業名を指定
-            "Subscription-Key": self.subscription_key
-        }
+        securities_reports = []
+        current_date = start_date
+        request_count = 0
+        days_with_reports = 0
         
-        try:
-            response = requests.get(url, params=params, headers=self.headers)
-            response.raise_for_status()
+        while current_date <= end_date:
+            date_str = current_date.strftime("%Y-%m-%d")
             
-            data = response.json()
-            
-            if "results" not in data or not data["results"]:
-                return {
-                    "success": False,
-                    "error": f"企業名 '{company_name}' に該当する企業が見つかりません"
-                }
-            
-            # 企業名の類似度でソートして最適な企業を選択
-            best_match = None
-            best_score = 0
-            
-            for result in data["results"]:
-                filer_name = result.get("filerName", "")
-                # 類似度を計算
-                score = SequenceMatcher(None, company_name, filer_name).ratio()
+            try:
+                # API制限対策で少し待機
+                if request_count > 0 and request_count % 15 == 0:
+                    print(f"  💤 API制限対策で3秒待機... ({request_count}日処理済み)")
+                    time.sleep(3)
                 
-                if score > best_score:
-                    best_score = score
-                    best_match = result
-            
-            # 類似度が50%未満の場合はマッチ失敗とする
-            if best_score < 0.5:
-                return {
-                    "success": False,
-                    "error": f"企業名 '{company_name}' に十分に類似する企業が見つかりません（最高類似度: {best_score:.2%}）"
-                }
-            
-            return {
-                "success": True,
-                "company_info": best_match,
-                "similarity_score": best_score
-            }
-            
-        except requests.exceptions.RequestException as e:
-            return {
-                "success": False,
-                "error": f"企業検索API呼び出しエラー: {str(e)}"
-            }
+                documents = self._get_securities_reports_by_date(date_str)
+                if documents:
+                    securities_reports.extend(documents)
+                    days_with_reports += 1
+                    print(f"  📅 {date_str}: {len(documents)}件の有価証券報告書")
+                
+                request_count += 1
+                current_date += timedelta(days=1)
+                
+                # 進捗表示（週単位）
+                if request_count % 7 == 0:
+                    progress = (request_count / search_days) * 100
+                    print(f"  📊 進捗: {progress:.1f}% ({request_count}/{search_days}日)")
+                
+            except Exception as e:
+                print(f"  ❌ {date_str} の取得でエラー: {str(e)}")
+                current_date += timedelta(days=1)
+                continue
+        
+        print(f"✅ 検索完了: {days_with_reports}日間で合計 {len(securities_reports)} 件の有価証券報告書を取得")
+        return securities_reports
     
-    def search_latest_securities_report(self, edin_code):
+    def _get_securities_reports_by_date(self, date_str):
         """
-        EDINコードを使って最新の有価証券報告書を検索
-        
-        Args:
-            edin_code (str): EDINコード
-            
-        Returns:
-            dict: 検索結果
+        指定日の有価証券報告書のみを取得
         """
         url = f"{self.base_url}/documents.json"
         
-        end_date = datetime.now().strftime("%Y-%m-%d")
-        start_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-        
         params = {
-            "date": end_date,
-            "type": "2",  # EDINコードでの検索
-            "code": edin_code,
+            "date": date_str,
+            "type": "2",  # 提出書類一覧およびメタデータを取得
             "Subscription-Key": self.subscription_key
         }
         
         try:
-            response = requests.get(url, params=params, headers=self.headers)
+            response = requests.get(url, params=params, headers=self.headers, timeout=30)
             response.raise_for_status()
             
             data = response.json()
             
-            # 有価証券報告書（120）でフィルタリング
             securities_reports = []
-            if "results" in data:
+            if "results" in data and data["results"]:
                 for result in data["results"]:
-                    if "120" in result.get("ordinanceCode", ""):
-                        securities_reports.append(result)
-            
-            if securities_reports:
-                # 提出日でソートして最新のものを返す
-                securities_reports.sort(key=lambda x: x.get("submitDateTime", ""), reverse=True)
-                return {
-                    "success": True,
-                    "document": securities_reports[0]
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "有価証券報告書が見つかりません"
-                }
+                    # 有価証券報告書（docTypeCode: 120）のみをフィルタリング
+                    if result.get("docTypeCode") == "120":
+                        # 証券コードまたはEDINETコードがある企業のみ（上場企業等）
+                        if result.get("secCode") or result.get("edinetCode"):
+                            securities_reports.append(result)
+                
+            return securities_reports
                 
         except requests.exceptions.RequestException as e:
-            return {
-                "success": False,
-                "error": f"有価証券報告書検索エラー: {str(e)}"
-            }
+            raise Exception(f"API request failed: {str(e)}")
+    
+    def find_latest_company_reports(self, company_names, securities_reports):
+        """
+        企業名リストに該当する最新の有価証券報告書を検索
+        
+        Args:
+            company_names (list): 検索する企業名のリスト
+            securities_reports (list): 検索対象の有価証券報告書データ
+        
+        Returns:
+            dict: 企業名をキーとした最新報告書データの辞書
+        """
+        company_reports = {}
+        
+        print(f"\\n🔍 {len(company_names)} 社の最新有価証券報告書を検索中...")
+        
+        for company_name in company_names:
+            print(f"📊 {company_name} の最新報告書を検索中...")
+            
+            company_matches = []
+            
+            # 全有価証券報告書から企業名にマッチするものを検索
+            for report in securities_reports:
+                filer_name = report.get("filerName", "")
+                if not filer_name:
+                    continue
+                
+                # 類似度計算
+                score = SequenceMatcher(None, company_name.lower(), filer_name.lower()).ratio()
+                
+                if score >= 0.5:  # 50%以上の類似度があるもの
+                    company_matches.append({
+                        "report": report,
+                        "score": score,
+                        "filer_name": filer_name,
+                        "submit_date": report.get("submitDateTime", "")
+                    })
+            
+            if company_matches:
+                # 類似度順でソート、同じ企業の場合は提出日順でソート
+                company_matches.sort(key=lambda x: (x["score"], x["submit_date"]), reverse=True)
+                
+                # 最高類似度のグループを取得
+                best_score = company_matches[0]["score"]
+                best_matches = [m for m in company_matches if m["score"] == best_score]
+                
+                # 同じ企業の場合は最新の報告書を選択
+                latest_match = max(best_matches, key=lambda x: x["submit_date"])
+                
+                company_reports[company_name] = {
+                    "report": latest_match["report"],
+                    "actual_name": latest_match["filer_name"],
+                    "similarity": latest_match["score"],
+                    "submit_date": latest_match["submit_date"],
+                    "alternatives_count": len(company_matches) - 1
+                }
+                
+                submit_date = latest_match["submit_date"][:10] if latest_match["submit_date"] else "不明"
+                print(f"  ✅ 発見: {latest_match['filer_name']}")
+                print(f"     類似度: {latest_match['score']:.2%} | 提出日: {submit_date}")
+                if len(company_matches) > 1:
+                    print(f"     他に {len(company_matches)-1} 件の候補報告書がありました")
+            else:
+                company_reports[company_name] = {
+                    "report": None,
+                    "actual_name": "",
+                    "similarity": 0,
+                    "error": f"類似度50%以上の企業が見つかりませんでした",
+                    "alternatives_count": 0
+                }
+                print(f"  ❌ 見つからず: 該当する企業の有価証券報告書が見つかりません")
+        
+        return company_reports
     
     def get_xbrl_document(self, doc_id):
         """XBRLドキュメントを取得"""
@@ -155,7 +193,7 @@ class EDINETCompanyNameExtractor:
         }
         
         try:
-            response = requests.get(url, params=params, headers=self.headers)
+            response = requests.get(url, params=params, headers=self.headers, timeout=60)
             response.raise_for_status()
             
             return {
@@ -175,7 +213,7 @@ class EDINETCompanyNameExtractor:
         """
         try:
             csv_text = csv_content.decode('utf-8')
-            lines = csv_text.strip().split('\n')
+            lines = csv_text.strip().split('\\n')
             
             if len(lines) < 2:
                 return {"success": False, "error": "CSVデータが不正です"}
@@ -183,7 +221,23 @@ class EDINETCompanyNameExtractor:
             # CSVをパース
             data_rows = []
             for line in lines:
-                row = [item.strip('"') for item in line.split('","')]
+                # CSVの行を適切に分割（引用符内のカンマを考慮）
+                row = []
+                current_field = ""
+                in_quotes = False
+                
+                for char in line:
+                    if char == '"':
+                        in_quotes = not in_quotes
+                    elif char == ',' and not in_quotes:
+                        row.append(current_field.strip('"'))
+                        current_field = ""
+                    else:
+                        current_field += char
+                
+                # 最後のフィールドを追加
+                row.append(current_field.strip('"'))
+                
                 if len(row) >= 6:
                     data_rows.append(row)
             
@@ -220,7 +274,7 @@ class EDINETCompanyNameExtractor:
                         
                         # グループ企業情報の抽出
                         if any(term in element_name for term in ["subsidiary", "affiliate", "関係会社", "子会社"]):
-                            if isinstance(value, str) and len(value) > 3:  # 意味のある文字列のみ
+                            if isinstance(value, str) and len(value) > 3:
                                 subsidiary_info.append(value)
             
             # 内部キーワード情報を削除
@@ -228,7 +282,7 @@ class EDINETCompanyNameExtractor:
             
             # グループ企業情報をまとめる
             if subsidiary_info:
-                data_dict["関連企業情報"] = "; ".join(set(subsidiary_info[:5]))  # 重複除去して最大5件
+                data_dict["関連企業情報"] = "; ".join(set(subsidiary_info[:5]))
             
             return {
                 "success": True,
@@ -247,7 +301,7 @@ class EDINETCompanyNameExtractor:
             # カンマや円マークを除去
             cleaned = re.sub(r'[,¥円]', '', str(value_str))
             # 数値以外の文字を除去（マイナス記号と小数点は保持）
-            cleaned = re.sub(r'[^\d.-]', '', cleaned)
+            cleaned = re.sub(r'[^\\d.-]', '', cleaned)
             
             if cleaned and cleaned != '-':
                 return float(cleaned)
@@ -255,29 +309,53 @@ class EDINETCompanyNameExtractor:
         except:
             return None
     
-    def extract_companies_data(self, company_names):
+    def extract_companies_data(self, company_names, search_days=365):
         """
         複数企業名のデータを抽出
         
         Args:
             company_names (list): 企業名のリスト
-            
+            search_days (int): 検索する過去の日数
+        
         Returns:
             pd.DataFrame: 抽出結果のDataFrame
         """
-        results = []
-        
+        print(f"=== EDINET企業財務データ抽出開始 ===")
         print(f"対象企業数: {len(company_names)}")
+        print(f"検索期間: 過去{search_days}日")
         print("=" * 60)
         
+        # 1. 期間設定
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=search_days)
+        
+        # 2. 期間内の全書類を取得
+        all_documents = self.search_documents_by_date_range(
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+            max_days=search_days
+        )
+        
+        if not all_documents:
+            print("❌ 期間内に書類が見つかりませんでした")
+            return pd.DataFrame()
+        
+        # 3. 企業名で書類を検索
+        company_documents = self.find_company_documents(company_names, all_documents)
+        
+        # 4. 各企業のデータを抽出
+        results = []
+        
+        print(f"\\n=== 財務データ抽出開始 ===")
+        
         for i, company_name in enumerate(company_names, 1):
-            print(f"[{i}/{len(company_names)}] 処理中: {company_name}")
+            print(f"\\n[{i}/{len(company_names)}] {company_name} の財務データを抽出中...")
             
-            # 1. 企業名で企業を検索
-            search_result = self.search_company_by_name(company_name)
+            company_info = company_documents.get(company_name)
             
-            if not search_result["success"]:
-                print(f"  ❌ 企業検索エラー: {search_result['error']}")
+            if not company_info or not company_info.get("document"):
+                error_msg = company_info.get("error", "不明なエラー") if company_info else "企業情報が見つかりません"
+                print(f"  ❌ エラー: {error_msg}")
                 results.append({
                     "企業名": company_name,
                     "docID": None,
@@ -285,46 +363,26 @@ class EDINETCompanyNameExtractor:
                     "売上高": None,
                     "資本金": None,
                     "従業員数": None,
-                    "エラー": search_result["error"]
+                    "エラー": error_msg
                 })
                 continue
             
-            company_info = search_result["company_info"]
-            edin_code = company_info.get("edinetCode")
-            actual_company_name = company_info.get("filerName", company_name)
-            similarity = search_result["similarity_score"]
-            
-            print(f"  🔍 マッチした企業: {actual_company_name} (類似度: {similarity:.2%})")
-            
-            # 2. 最新の有価証券報告書を検索
-            report_result = self.search_latest_securities_report(edin_code)
-            
-            if not report_result["success"]:
-                print(f"  ❌ 有価証券報告書検索エラー: {report_result['error']}")
-                results.append({
-                    "企業名": actual_company_name,
-                    "docID": None,
-                    "docDescription": None,
-                    "売上高": None,
-                    "資本金": None,
-                    "従業員数": None,
-                    "エラー": report_result["error"]
-                })
-                continue
-            
-            doc = report_result["document"]
+            doc = company_info["document"]
+            actual_name = company_info["actual_name"]
             doc_id = doc.get("docID")
             doc_description = doc.get("docDescription", "")
             
+            print(f"  📄 企業名: {actual_name}")
             print(f"  📄 報告書: {doc_description}")
+            print(f"  📄 docID: {doc_id}")
             
-            # 3. XBRLデータを取得
+            # XBRLデータを取得
             xbrl_result = self.get_xbrl_document(doc_id)
             
             if not xbrl_result["success"]:
                 print(f"  ❌ XBRLデータ取得エラー: {xbrl_result['error']}")
                 results.append({
-                    "企業名": actual_company_name,
+                    "企業名": actual_name,
                     "docID": doc_id,
                     "docDescription": doc_description,
                     "売上高": None,
@@ -334,13 +392,13 @@ class EDINETCompanyNameExtractor:
                 })
                 continue
             
-            # 4. 財務データを抽出
+            # 財務データを抽出
             financial_result = self.extract_financial_data_from_csv(xbrl_result["content"])
             
             if not financial_result["success"]:
                 print(f"  ❌ 財務データ抽出エラー: {financial_result['error']}")
                 results.append({
-                    "企業名": actual_company_name,
+                    "企業名": actual_name,
                     "docID": doc_id,
                     "docDescription": doc_description,
                     "売上高": None,
@@ -350,11 +408,11 @@ class EDINETCompanyNameExtractor:
                 })
                 continue
             
-            # 5. 結果をまとめる
+            # 結果をまとめる
             financial_data = financial_result["data"]
             
             company_data = {
-                "企業名": actual_company_name,
+                "企業名": actual_name,
                 "docID": doc_id,
                 "docDescription": doc_description,
                 "売上高": financial_data.get("売上高"),
@@ -369,59 +427,11 @@ class EDINETCompanyNameExtractor:
             results.append(company_data)
             
             extracted_count = sum(1 for v in [financial_data.get("売上高"), financial_data.get("資本金"), financial_data.get("従業員数")] if v is not None)
-            print(f"  ✅ 完了: {extracted_count}/3 個の指標を抽出")
+            print(f"  ✅ 完了: {extracted_count}/3 個の財務指標を抽出")
         
         # DataFrameに変換
         df = pd.DataFrame(results)
         return df
-    
-    def validate_company_names(self, company_names):
-        """
-        企業名リストの事前検証
-        
-        Args:
-            company_names (list): 企業名のリスト
-            
-        Returns:
-            dict: 検証結果
-        """
-        print("=== 企業名の事前検証 ===")
-        
-        validation_results = []
-        valid_companies = []
-        invalid_companies = []
-        
-        for company_name in company_names:
-            search_result = self.search_company_by_name(company_name)
-            
-            if search_result["success"]:
-                actual_name = search_result["company_info"].get("filerName", "")
-                similarity = search_result["similarity_score"]
-                
-                validation_results.append({
-                    "入力企業名": company_name,
-                    "マッチした企業名": actual_name,
-                    "類似度": f"{similarity:.2%}",
-                    "status": "✅ マッチ"
-                })
-                valid_companies.append(company_name)
-                print(f"✅ {company_name} → {actual_name} (類似度: {similarity:.2%})")
-            else:
-                validation_results.append({
-                    "入力企業名": company_name,
-                    "マッチした企業名": "",
-                    "類似度": "",
-                    "status": f"❌ {search_result['error']}"
-                })
-                invalid_companies.append(company_name)
-                print(f"❌ {company_name}: {search_result['error']}")
-        
-        return {
-            "validation_df": pd.DataFrame(validation_results),
-            "valid_companies": valid_companies,
-            "invalid_companies": invalid_companies,
-            "success_rate": len(valid_companies) / len(company_names) if company_names else 0
-        }
 
 def main():
     # APIキーを設定
@@ -433,9 +443,9 @@ def main():
         return
     
     # データ抽出クライアント初期化
-    extractor = EDINETCompanyNameExtractor(api_key)
+    extractor = EDINETCompanyExtractor(api_key)
     
-    # 対象企業名リスト（例）
+    # 対象企業名リスト
     company_names = [
         "NTTデータ",
         "富士通",
@@ -444,54 +454,79 @@ def main():
         "TIS"
     ]
     
-    print("=== EDINET 企業名検索・財務データ抽出 ===\n")
+    print("=== EDINET API v2 - 最新有価証券報告書抽出ツール ===\\n")
     
-    # 1. 企業名の事前検証
-    validation_result = extractor.validate_company_names(company_names)
+    # データ抽出実行（過去730日を検索して最新の有価証券報告書を確実に取得）
+    results_df = extractor.extract_companies_data(company_names, search_days=730)
     
-    print(f"\n企業名検証結果:")
-    print(validation_result["validation_df"].to_string(index=False))
-    print(f"\n成功率: {validation_result['success_rate']:.1%} ({len(validation_result['valid_companies'])}/{len(company_names)})")
+    if results_df.empty:
+        print("\\n❌ データが取得できませんでした。")
+        return
     
-    if validation_result["invalid_companies"]:
-        print(f"\n⚠️  以下の企業名は処理をスキップされます:")
-        for invalid_name in validation_result["invalid_companies"]:
-            print(f"   - {invalid_name}")
+    print(f"\\n{'='*80}")
+    print(f"=== 最終抽出結果 ===")
+    print(f"{'='*80}")
     
-    # 2. 有効な企業のデータ抽出
-    if validation_result["valid_companies"]:
-        print(f"\n=== 財務データ抽出開始 ===")
-        
-        results_df = extractor.extract_companies_data(validation_result["valid_companies"])
-        
-        print(f"\n=== 抽出結果 ===")
-        print(results_df.to_string(index=False))
-        
-        # 3. ファイル保存
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        # CSV保存
-        csv_filename = f"company_financial_data_{timestamp}.csv"
-        results_df.to_csv(csv_filename, index=False, encoding='utf-8-sig')
-        print(f"\n📁 結果をCSVファイルに保存: {csv_filename}")
-        
-        # Excel保存
-        excel_filename = f"company_financial_data_{timestamp}.xlsx"
-        with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
-            results_df.to_excel(writer, sheet_name='財務データ', index=False)
-            validation_result["validation_df"].to_excel(writer, sheet_name='企業名検証', index=False)
-        
-        print(f"📁 結果をExcelファイルに保存: {excel_filename}")
-        
-        # 4. 統計情報
-        success_count = len(results_df[results_df["エラー"].isna()]) if "エラー" in results_df.columns else len(results_df)
-        print(f"\n📊 統計情報:")
-        print(f"   処理企業数: {len(results_df)}")
-        print(f"   成功企業数: {success_count}")
-        print(f"   成功率: {success_count/len(results_df):.1%}")
+    # 結果を見やすくフォーマットして表示
+    display_df = results_df.copy()
     
-    else:
-        print("\n❌ 有効な企業名が見つからないため、データ抽出を実行できません。")
+    # 数値をフォーマット
+    for col in ['売上高', '資本金']:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].apply(
+                lambda x: f"{x:,.0f}円" if pd.notnull(x) and x != 0 else "データなし"
+            )
+    
+    if '従業員数' in display_df.columns:
+        display_df['従業員数'] = display_df['従業員数'].apply(
+            lambda x: f"{x:,.0f}人" if pd.notnull(x) and x != 0 else "データなし"
+        )
+    
+    print(display_df.to_string(index=False))
+    
+    # ファイル保存
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # CSV保存（生データ）
+    csv_filename = f"latest_securities_reports_{timestamp}.csv"
+    results_df.to_csv(csv_filename, index=False, encoding='utf-8-sig')
+    print(f"\\n📁 生データをCSVファイルに保存: {csv_filename}")
+    
+    # Excel保存（フォーマット済み）
+    excel_filename = f"latest_securities_reports_{timestamp}.xlsx"
+    with pd.ExcelWriter(excel_filename, engine='openpyxl') as writer:
+        # 生データシート
+        results_df.to_excel(writer, sheet_name='生データ', index=False)
+        # フォーマット済みシート
+        display_df.to_excel(writer, sheet_name='フォーマット済み', index=False)
+    
+    print(f"📁 結果をExcelファイルに保存: {excel_filename}")
+    print(f"   - '生データ'シート: 元の数値データ")
+    print(f"   - 'フォーマット済み'シート: 見やすく整形されたデータ")
+    
+    # 統計情報の詳細表示
+    success_count = len(results_df[results_df["エラー"].isna()]) if "エラー" in results_df.columns else len(results_df)
+    
+    print(f"\\n📊 抽出統計:")
+    print(f"   📈 処理企業数: {len(results_df)} 社")
+    print(f"   ✅ 成功企業数: {success_count} 社")
+    print(f"   📊 成功率: {success_count/len(results_df):.1%}")
+    
+    # 成功した企業の詳細
+    if success_count > 0:
+        successful_companies = results_df[results_df["エラー"].isna()] if "エラー" in results_df.columns else results_df
+        print(f"\\n✅ 成功した企業:")
+        for _, row in successful_companies.iterrows():
+            submit_date = row['提出日'] if '提出日' in row else 'N/A'
+            print(f"   • {row['企業名']} (提出日: {submit_date})")
+    
+    # 失敗した企業の詳細
+    if success_count < len(results_df):
+        failed_companies = results_df[results_df["エラー"].notna()] if "エラー" in results_df.columns else pd.DataFrame()
+        if not failed_companies.empty:
+            print(f"\\n❌ 失敗した企業:")
+            for _, row in failed_companies.iterrows():
+                print(f"   • {row['企業名']}: {row['エラー']}")
 
 if __name__ == "__main__":
     main()
